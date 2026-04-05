@@ -5,144 +5,212 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:  # Allows manual trigger
+  workflow_dispatch:  # Allow manual trigger
 
-# Define environment variables
 env:
   NODE_VERSION: '22'
+  APP_PORT: 3000
 
 jobs:
-  # JOB 1: Test
+  # ==================== TEST JOB ====================
   test:
     name: Test Application
-    runs-on: ubuntu-latest  # Uses GitHub-hosted runner for testing
+    runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout code
+      # Step 1: Checkout code
+      - name: Checkout Repository
         uses: actions/checkout@v4
       
+      # Step 2: Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
       
-      - name: Install dependencies
-        run: npm ci  # 'ci' is faster and more reliable for CI/CD
+      # Step 3: Install dependencies
+      - name: Install Dependencies
+        run: npm ci
       
-      - name: Run tests and capture results
+      # Step 4: Run tests and capture results
+      - name: Run Tests
+        id: tests
         run: |
-          # Create test-results directory
-          mkdir -p test-results
+          echo "========================================"
+          echo "Running Application Tests"
+          echo "========================================"
+          echo "Test started at: $(date)" > test-results.txt
+          echo "========================================" >> test-results.txt
           
-          # Run the check command and capture output
-          npm run check 2>&1 | tee test-results/test-output.txt
+          # Run the test command and capture output
+          if npm run check >> test-results.txt 2>&1; then
+            echo "✅ Tests PASSED" >> test-results.txt
+            echo "TEST_STATUS=passed" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Tests FAILED" >> test-results.txt
+            echo "TEST_STATUS=failed" >> $GITHUB_OUTPUT
+            cat test-results.txt
+            exit 1
+          fi
           
-          # Also save exit code for later
-          echo $? > test-results/exit-code.txt
+          echo "========================================" >> test-results.txt
+          echo "Test completed at: $(date)" >> test-results.txt
+          
+          # Display results in console
+          cat test-results.txt
       
-      - name: Upload test results as artifact
+      # Step 5: Upload test results as artifact
+      - name: Upload Test Results Artifact
         uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: test-results/
-          retention-days: 7  # Keep artifacts for 7 days
+          path: test-results.txt
+          retention-days: 7
+          if-no-files-found: error
+      
+      # Step 6: Upload test logs for debugging (if needed)
+      - name: Upload Test Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            test-results.txt
+            .npm/_logs/
+          retention-days: 3
 
-  # JOB 2: Deploy (depends on test job)
+  # ==================== DEPLOY JOB ====================
   deploy:
     name: Deploy to Self-Hosted Runner
-    needs: test  # This ensures deploy runs ONLY if test passes
-    runs-on: self-hosted  # Uses your self-hosted runner
-    # You can add labels if needed: runs-on: [self-hosted, linux, x64]
+    needs: test  # Depends on test job
+    runs-on: self-hosted  # Use self-hosted runner
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     
     steps:
-      - name: Checkout code
+      # Step 1: Checkout code
+      - name: Checkout Repository
         uses: actions/checkout@v4
       
-      - name: Download test results artifact
+      # Step 2: Download test results artifact
+      - name: Download Test Results
         uses: actions/download-artifact@v4
         with:
           name: test-results
-          path: ./downloaded-test-results
+          path: ./test-artifacts
       
-      - name: Display test results content
+      # Step 3: Display test results content
+      - name: Display Test Results
         run: |
-          echo "========== TEST RESULTS =========="
-          echo ""
-          echo "--- Test Output ---"
-          cat ./downloaded-test-results/test-output.txt || echo "No test output file found"
-          echo ""
-          echo "--- Exit Code ---"
-          cat ./downloaded-test-results/exit-code.txt || echo "No exit code file found"
-          echo ""
-          echo "=================================="
-          echo "Test job completed successfully. Proceeding with deployment..."
+          echo "========================================"
+          echo "📋 TEST RESULTS FROM TEST JOB"
+          echo "========================================"
+          if [ -f "./test-artifacts/test-results.txt" ]; then
+            cat ./test-artifacts/test-results.txt
+            echo "========================================"
+            echo "✅ Test results loaded successfully"
+          else
+            echo "⚠️ Warning: Test results file not found!"
+          fi
       
-      - name: Setup Node.js on self-hosted runner
+      # Step 4: Setup Node.js on self-hosted runner
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
       
-      - name: Install dependencies
+      # Step 5: Install dependencies
+      - name: Install Dependencies
         run: npm ci
       
-      - name: Install PM2 globally (if not already installed)
+      # Step 6: Stop existing application (if running)
+      - name: Stop Existing Application
         run: |
+          echo "🛑 Stopping existing application..."
+          # Stop using PM2 if running
+          if command -v pm2 &> /dev/null; then
+            pm2 delete node-app || true
+            pm2 save || true
+          fi
+          
+          # Also kill any process on port 3000
+          sudo fuser -k ${{ env.APP_PORT }}/tcp || true
+        continue-on-error: true
+      
+      # Step 7: Deploy application
+      - name: Deploy Application
+        id: deploy
+        run: |
+          echo "========================================"
+          echo "🚀 DEPLOYING APPLICATION"
+          echo "========================================"
+          echo "Deployment started at: $(date)"
+          
+          # Install PM2 globally if not present
           if ! command -v pm2 &> /dev/null; then
+            echo "📦 Installing PM2..."
             npm install -g pm2
           fi
-      
-      - name: Deploy application
-        run: |
-          # Kill any existing process running on port 3000
-          # Using different approaches for compatibility
-          echo "Stopping existing application if running..."
-          pm2 delete node-app || true
           
-          # Also kill any process on port 3000 as backup
-          sudo fuser -k 3000/tcp || true
+          # Start application with PM2
+          echo "▶️ Starting application with PM2..."
+          pm2 start src/server.js --name node-app --time
           
-          # Start the application with PM2
-          echo "Starting application..."
-          pm2 start src/server.js --name node-app
-          
-          # Save PM2 process list
+          # Save PM2 configuration
           pm2 save
           
-          # Wait a moment for the server to start
-          sleep 3
+          # Setup PM2 to start on boot
+          pm2 startup || true
           
-          # Verify the application is running
-          echo "Verifying application is running..."
-          curl -s http://localhost:3000/ || echo "Warning: Could not verify root endpoint"
-          curl -s http://localhost:3000/api || echo "Warning: Could not verify API endpoint"
+          # Wait for application to start
+          sleep 5
+          
+          # Verify application is running
+          echo "🔍 Verifying application..."
+          if curl -s http://localhost:${{ env.APP_PORT }}/ > /dev/null; then
+            echo "✅ Application is running on port ${{ env.APP_PORT }}"
+            echo "DEPLOY_STATUS=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Application failed to start"
+            pm2 logs node-app --lines 20
+            exit 1
+          fi
+          
+          echo "Deployment completed at: $(date)"
       
-      - name: Display PM2 status
+      # Step 8: Verify API endpoint
+      - name: Verify API Endpoint
         run: |
-          echo "========== PM2 PROCESS STATUS =========="
+          echo "========================================"
+          echo "🔍 VERIFYING API ENDPOINT"
+          echo "========================================"
+          API_RESPONSE=$(curl -s http://localhost:${{ env.APP_PORT }}/api)
+          echo "API Response: $API_RESPONSE"
+          
+          if echo "$API_RESPONSE" | grep -q "json"; then
+            echo "✅ API endpoint is working correctly"
+          else
+            echo "⚠️ API endpoint response may need verification"
+          fi
+      
+      # Step 9: Display PM2 status
+      - name: Show PM2 Status
+        run: |
+          echo "========================================"
+          echo "📊 PM2 PROCESS STATUS"
+          echo "========================================"
           pm2 status
           echo "========================================"
+          echo "📋 Recent logs:"
+          pm2 logs node-app --lines 10 --nostream
       
-      - name: Check application health
+      # Step 10: Deployment summary
+      - name: Deployment Summary
         run: |
-          echo "Checking if application is accessible..."
-          # Check root endpoint
-          ROOT_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/)
-          if [ "$ROOT_RESPONSE" = "200" ]; then
-            echo "✓ Root endpoint (/) is responding with status $ROOT_RESPONSE"
-          else
-            echo "✗ Root endpoint (/) returned status $ROOT_RESPONSE"
-            exit 1
-          fi
-          
-          # Check API endpoint
-          API_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api)
-          if [ "$API_RESPONSE" = "200" ]; then
-            echo "✓ API endpoint (/api) is responding with status $API_RESPONSE"
-          else
-            echo "✗ API endpoint (/api) returned status $API_RESPONSE"
-            exit 1
-          fi
-          
-          echo ""
-          echo "DEPLOYMENT SUCCESSFUL! Application is running on port 3000"
+          echo "========================================"
+          echo "🎉 DEPLOYMENT COMPLETE"
+          echo "========================================"
+          echo "✅ Application deployed successfully!"
+          echo "📍 Running on: http://localhost:${{ env.APP_PORT }}"
+          echo "📍 API endpoint: http://localhost:${{ env.APP_PORT }}/api"
+          echo "========================================"
