@@ -5,35 +5,34 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 env:
   NODE_VERSION: '22'
   APP_PORT: 3000
+  DOMAIN: '3.109.217.207'  # Replace with your EC2 public IP
 
 jobs:
-  # ==================== TEST JOB ====================
+  # ============================================
+  # TEST JOB - Runs on Ubuntu Latest
+  # ============================================
   test:
     name: Test Application
     runs-on: ubuntu-latest
     
     steps:
-      # Step 1: Checkout code
       - name: Checkout Repository
         uses: actions/checkout@v4
       
-      # Step 2: Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
       
-      # Step 3: Install dependencies
       - name: Install Dependencies
         run: npm ci
       
-      # Step 4: Run tests and capture results
       - name: Run Tests
         id: tests
         run: |
@@ -43,7 +42,6 @@ jobs:
           echo "Test started at: $(date)" > test-results.txt
           echo "========================================" >> test-results.txt
           
-          # Run the test command and capture output
           if npm run check >> test-results.txt 2>&1; then
             echo "✅ Tests PASSED" >> test-results.txt
             echo "TEST_STATUS=passed" >> $GITHUB_OUTPUT
@@ -56,11 +54,8 @@ jobs:
           
           echo "========================================" >> test-results.txt
           echo "Test completed at: $(date)" >> test-results.txt
-          
-          # Display results in console
           cat test-results.txt
       
-      # Step 5: Upload test results as artifact
       - name: Upload Test Results Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -68,38 +63,26 @@ jobs:
           path: test-results.txt
           retention-days: 7
           if-no-files-found: error
-      
-      # Step 6: Upload test logs for debugging (if needed)
-      - name: Upload Test Logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-logs
-          path: |
-            test-results.txt
-            .npm/_logs/
-          retention-days: 3
 
-  # ==================== DEPLOY JOB ====================
+  # ============================================
+  # DEPLOY JOB - Runs on Self-Hosted Runner (EC2)
+  # ============================================
   deploy:
-    name: Deploy to Self-Hosted Runner
-    needs: test  # Depends on test job
-    runs-on: self-hosted  # Use self-hosted runner
+    name: Deploy to EC2 with Nginx
+    needs: test
+    runs-on: self-hosted
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     
     steps:
-      # Step 1: Checkout code
       - name: Checkout Repository
         uses: actions/checkout@v4
       
-      # Step 2: Download test results artifact
       - name: Download Test Results
         uses: actions/download-artifact@v4
         with:
           name: test-results
           path: ./test-artifacts
       
-      # Step 3: Display test results content
       - name: Display Test Results
         run: |
           echo "========================================"
@@ -113,32 +96,86 @@ jobs:
             echo "⚠️ Warning: Test results file not found!"
           fi
       
-      # Step 4: Setup Node.js on self-hosted runner
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
       
-      # Step 5: Install dependencies
-      - name: Install Dependencies
-        run: npm ci
+      # ============================================
+      # NGINX SETUP - For External Access
+      # ============================================
+      - name: Install and Configure Nginx
+        run: |
+          echo "========================================"
+          echo "🌐 INSTALLING AND CONFIGURING NGINX"
+          echo "========================================"
+          
+          # Install Nginx if not present
+          if ! command -v nginx &> /dev/null; then
+            sudo apt update
+            sudo apt install -y nginx
+          fi
+          
+          # Create Nginx configuration for the app
+          sudo tee /etc/nginx/sites-available/node-app > /dev/null <<EOF
+          server {
+              listen 80;
+              server_name ${{ env.DOMAIN }};
+              
+              location / {
+                  proxy_pass http://localhost:${{ env.APP_PORT }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade \$http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host \$host;
+                  proxy_cache_bypass \$http_upgrade;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+              
+              location /api {
+                  proxy_pass http://localhost:${{ env.APP_PORT }}/api;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+              }
+          }
+          EOF
+          
+          # Enable the site
+          sudo ln -sf /etc/nginx/sites-available/node-app /etc/nginx/sites-enabled/
+          
+          # Remove default site if exists
+          sudo rm -f /etc/nginx/sites-enabled/default
+          
+          # Test Nginx configuration
+          sudo nginx -t
+          
+          # Restart Nginx
+          sudo systemctl restart nginx
+          sudo systemctl enable nginx
+          
+          echo "✅ Nginx configured successfully"
       
-      # Step 6: Stop existing application (if running)
+      - name: Install Dependencies
+        run: |
+          echo "========================================"
+          echo "📦 INSTALLING DEPENDENCIES"
+          echo "========================================"
+          npm ci
+      
       - name: Stop Existing Application
         run: |
           echo "🛑 Stopping existing application..."
-          # Stop using PM2 if running
           if command -v pm2 &> /dev/null; then
             pm2 delete node-app || true
             pm2 save || true
           fi
-          
-          # Also kill any process on port 3000
           sudo fuser -k ${{ env.APP_PORT }}/tcp || true
         continue-on-error: true
       
-      # Step 7: Deploy application
-      - name: Deploy Application
+      - name: Deploy Application with PM2
         id: deploy
         run: |
           echo "========================================"
@@ -149,7 +186,7 @@ jobs:
           # Install PM2 globally if not present
           if ! command -v pm2 &> /dev/null; then
             echo "📦 Installing PM2..."
-            npm install -g pm2
+            sudo npm install -g pm2
           fi
           
           # Start application with PM2
@@ -160,13 +197,12 @@ jobs:
           pm2 save
           
           # Setup PM2 to start on boot
-          pm2 startup || true
+          pm2 startup | grep -v "sudo" | bash || true
           
           # Wait for application to start
           sleep 5
           
-          # Verify application is running
-          echo "🔍 Verifying application..."
+          # Verify application is running locally
           if curl -s http://localhost:${{ env.APP_PORT }}/ > /dev/null; then
             echo "✅ Application is running on port ${{ env.APP_PORT }}"
             echo "DEPLOY_STATUS=success" >> $GITHUB_OUTPUT
@@ -178,22 +214,49 @@ jobs:
           
           echo "Deployment completed at: $(date)"
       
-      # Step 8: Verify API endpoint
-      - name: Verify API Endpoint
+      # ============================================
+      # EXTERNAL ACCESS VERIFICATION
+      # ============================================
+      - name: Verify External Access via Nginx
         run: |
           echo "========================================"
-          echo "🔍 VERIFYING API ENDPOINT"
+          echo "🌍 VERIFYING EXTERNAL ACCESS"
           echo "========================================"
-          API_RESPONSE=$(curl -s http://localhost:${{ env.APP_PORT }}/api)
+          
+          # Get EC2 public IP (if not set in env)
+          EC2_IP="${{ env.DOMAIN }}"
+          if [ -z "$EC2_IP" ]; then
+            EC2_IP=$(curl -s http://checkip.amazonaws.com)
+          fi
+          
+          echo "Testing access via: http://$EC2_IP"
+          
+          # Test homepage via localhost (through Nginx)
+          echo "Testing homepage through Nginx proxy..."
+          HOMEPAGE_RESPONSE=$(curl -s -w "\nHTTP Status: %{http_code}" http://localhost/)
+          echo "$HOMEPAGE_RESPONSE"
+          
+          # Test API endpoint via localhost (through Nginx)
+          echo -e "\nTesting API endpoint through Nginx proxy..."
+          API_RESPONSE=$(curl -s http://localhost/api)
           echo "API Response: $API_RESPONSE"
           
-          if echo "$API_RESPONSE" | grep -q "json"; then
-            echo "✅ API endpoint is working correctly"
-          else
-            echo "⚠️ API endpoint response may need verification"
-          fi
+          echo "========================================"
+          echo "✅ External access is configured!"
+          echo "📍 Access your app at: http://$EC2_IP"
+          echo "📍 API endpoint: http://$EC2_IP/api"
+          echo "========================================"
       
-      # Step 9: Display PM2 status
+      - name: Verify Nginx Status
+        run: |
+          echo "========================================"
+          echo "🔍 NGINX STATUS"
+          echo "========================================"
+          sudo systemctl status nginx --no-pager
+          echo ""
+          echo "📋 Nginx enabled sites:"
+          ls -la /etc/nginx/sites-enabled/
+      
       - name: Show PM2 Status
         run: |
           echo "========================================"
@@ -204,13 +267,48 @@ jobs:
           echo "📋 Recent logs:"
           pm2 logs node-app --lines 10 --nostream
       
-      # Step 10: Deployment summary
       - name: Deployment Summary
         run: |
+          EC2_IP="${{ env.DOMAIN }}"
           echo "========================================"
           echo "🎉 DEPLOYMENT COMPLETE"
           echo "========================================"
           echo "✅ Application deployed successfully!"
-          echo "📍 Running on: http://localhost:${{ env.APP_PORT }}"
-          echo "📍 API endpoint: http://localhost:${{ env.APP_PORT }}/api"
+          echo ""
+          echo "📍 EXTERNAL ACCESS (via Nginx):"
+          echo "   http://$EC2_IP"
+          echo "   http://$EC2_IP/api"
+          echo ""
+          echo "📍 LOCAL ACCESS (direct):"
+          echo "   http://localhost:${{ env.APP_PORT }}"
+          echo "   http://localhost:${{ env.APP_PORT }}/api"
+          echo ""
+          echo "📍 Nginx Configuration:"
+          echo "   /etc/nginx/sites-available/node-app"
+          echo ""
+          echo "📍 PM2 Management:"
+          echo "   pm2 status"
+          echo "   pm2 logs node-app"
+          echo "   pm2 restart node-app"
           echo "========================================"
+      
+      # ============================================
+      # HEALTH CHECK (Public URL)
+      # ============================================
+      - name: Health Check via Public URL
+        run: |
+          echo "========================================"
+          echo "🏥 HEALTH CHECK (Public URL)"
+          echo "========================================"
+          EC2_IP="${{ env.DOMAIN }}"
+          
+          # Wait a few seconds for Nginx to fully start
+          sleep 3
+          
+          # Test public access
+          if curl -s --max-time 10 http://$EC2_IP/ > /dev/null; then
+            echo "✅ Application is accessible from outside!"
+          else
+            echo "⚠️ Could not verify external access. Check security group settings."
+            echo "   Make sure port 80 (HTTP) is open in EC2 security group."
+          fi
